@@ -1,0 +1,64 @@
+PROTOTYPE REPORT: TABULAR → CONTINUOUS RL FOR DELIVERY/FIRE TASK
+
+PURPOSE
+Test the core assumptions of the individual proposal before committing to MARL: is the allocation/routing problem solvable with standard RL in a simplified version of the domain, and what breaks when it scales?
+
+ENVIRONMENT
+Grid delivery task, one fire (goal), 1–2 drones. Start at center (3,3) on 7×7. Visibility radius 2. Reward: −1/step, +10 on goal. Horizon 60 steps. Fire spawn evolved through three stages: uniform → single hotspot → two symmetric hotspots. This progression turned out to be the most informative design choice.
+
+TABULAR RESULTS
+
+Finding 1 — the ceiling is informational, not algorithmic.
+8×8, uniform fire: Q-learning 21%, SARSA 30%, Dyna-Q 55%.
+7×7, two symmetric hotspots, no memory: 14–54% across algorithms.
+7×7, two symmetric hotspots, with memory: 91–98% for Q-learning and SARSA.
+With symmetric goals the hidden state is identical regardless of where the fire is, so Q-values average over equally likely positions and converge to arbitrary fixed points. The 2-cycle oscillation in sample paths is this degeneracy. Adding two boolean "corner searched" bits to the state lets plain Q-learning reach 95%. The fix is representational, not algorithmic.
+
+Finding 2 — Dyna-Q+ failed for identifiable reasons.
+It collapsed to 0–4%. Not an implementation bug: (a) frozen-Q evaluation measures the exploration policy, since Dyna-Q+ bakes exploration bonuses into Q; (b) κ was ~50× too large for the episode length, so the bonus dwarfed the step reward.
+
+Finding 3 — planning accelerates correlated failure in multi-agent settings.
+10 seeds, two independent learners: Q-learning mean ~73% (46–98%), SARSA ~88% (61–99%), Dyna-Q ~80% (54–95%). Dyna-Q is the most sophisticated single-agent method and the least reliable multi-agent method. Faster convergence locks both Q-tables onto the same corner before exploration noise can diverge them.
+
+Finding 4 — coordination emerges by luck, not by learning.
+Two independent learners either split to opposite corners (95–99%, total_agent_steps ≈1.2× baseline) or both commit to the same corner (~50%, ≈5–7× duplication). The split is seed-dependent. Per-agent RNG reduces variance; asymmetric initialization did not eliminate it.
+
+CONTINUOUS RESULTS
+
+DQN, hidden=32, batch=32, discrete actions, corner memory (7-dim state).
+
+Three single-agent configurations:
+  1000 episodes, 20k buffer:          50.8% mean (seeds 0/1/2: 47.0 / 52.7 / 52.7).
+  3000 episodes, 20k buffer:          18.3% (seed 0) — REGRESSION.
+  3000 episodes, 100k buffer + DDQN:  50.9% mean (seeds 0/1/2: 47.0 / 53.0 / 52.7).
+
+The 18% regression was diagnosed as replay-buffer eviction: at ~15 steps/episode × 3000 episodes ≈ 45k transitions, a 20k buffer is fully recycled by episode ~1400, evicting the rare "found corner" experiences that drive learning. A 100k buffer (no eviction within training) plus Double DQN (removes overestimation bias) fully reversed the regression — but did not raise the ceiling.
+
+The 51% ceiling is a credit-assignment limit, not a data limit. The network learns "go to corner A" reliably (~9 steps, matches center-to-corner distance), but cannot learn the conditional second leg ("if A was already searched and the fire is not visible, go to B"). States where searched_A=True are rare under the current policy, and the gradient from the ~10× more common searched_A=False states dominates. Memory bits are present in the state but not exploited by the policy.
+
+Two-agent DQN, independent learners, no memory:
+  Seeds 0/1/2: 93.3 / 93.7 / 93.0% success, ratio 2.94 / 2.72 / 2.84×.
+  Compare to tabular 2-agent (10 seeds): mean ~73%, range 46–98%.
+  Neural coordination is more reliable than tabular (3/3 seeds split vs 2/3), and reproducible — but the ~2.8× duplication ratio is unchanged: one agent wins at ~13 steps, the other wastes a full trip to a different corner. This is the coordination baseline that MARL must beat.
+
+KEY TAKEAWAYS
+
+1. The bottleneck is information, not compute. Same observation, Q-learning 22% vs Dyna-Q 55% — algorithm quality is not the limiting factor. Fix the state and every algorithm jumps.
+
+2. Memory is the right fix and maps to the group project. "Corner searched" bits are a discretized belief state. Section 2.1's claim that the agent depends on perception and forecasting is exactly this: better environmental information takes the same algorithm from 22% to 95%.
+
+3. Coordination does not emerge from independent learning. Two good individual policies are often the same policy, and two of the same policy cover one hotspot, not two. The 2/1mem ratio is the right diagnostic.
+
+4. Function approximation introduces interference absent in tabular — and better data management is necessary but not sufficient. The 18% regression (buffer eviction) is a data-quality problem, fixed by a larger buffer + DDQN. The remaining 51% ceiling is a credit-assignment problem: the memory bit is present but the policy cannot exploit it because the required conditional (searched_A=True → go to B) is rare in the replay distribution. This is the specific gap that MARL's centralized critic and PPO's multi-epoch batches are designed to close.
+
+5. Diagnostics matter as much as algorithms. Five results (Dyna-Q+ at 0%, Dyna-Q n=50 underperforming n=10, DQN at 13% with a small buffer, DQN at 51% with a fixed buffer, Dyna-Q worsening multi-agent coordination) were only interpretable after identifying the mechanism — frozen-policy evaluation, tie-breaking noise, replay eviction, credit-assignment interference, correlated convergence.
+
+NEXT STEPS
+
+1. PPO, single-agent, discrete actions, with memory. On-policy + GAE + K epochs per batch directly targets the credit-assignment ceiling that DQN cannot pass. Target: >70% on all seeds.
+
+2. PPO multi-agent with a centralized critic (MAPPO-lite). Target: keep success at ~93% and drive the 2.8× duplication ratio toward 1.2×.
+
+3. Optionally, move to continuous actions once PPO works on the discrete version, as a cleaner PPO-vs-DQN comparison (DQN cannot act in continuous space).
+
+The tabular and continuous stages together establish that the coordination problem is real, measurable, and not solved by better single-agent algorithms — which is the premise of the individual project.
