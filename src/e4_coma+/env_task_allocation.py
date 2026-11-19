@@ -1,50 +1,69 @@
-"""Grid-city task allocation: 2 drones, 3 deliveries, 6x6 grid, full observability.
+"""Simple 3-drone task-allocation environment on a 6x6 grid.
 
-The reward function is PURE: `_transition(state, joint_action)` mutates nothing
-and returns (next_state, n_completions). `step()` calls it once for the actual
-joint action and n_agents * n_actions times for counterfactuals, producing a
-`per_alternative` table that the trainer uses for difference rewards.
+Actions: 0=up, 1=down, 2=left, 3=right.
+Each drone can carry at most one task. A task is completed when its assigned
+drone reaches its drop-off cell after picking it up.
 
-No shaping, no wall penalty. Reward: -0.1 per step, +5 per delivery.
+The transition function is pure: it does not mutate the environment. This
+allows step() to evaluate counterfactual actions for difference rewards.
 """
 import random
 
-GRID         = 6
-N_AGENTS     = 2
-N_TASKS      = 3
-MAX_STEPS    = 100
-STEP_REWARD  = -0.1
-DELIVERY_REW = 5.0
-ACTIONS      = [(0, 1), (0, -1), (-1, 0), (1, 0)]   # up, down, left, right
-DEPOT        = (0, 0)
+GRID = 6
+N_AGENTS = 3
+N_TASKS = 3
+MAX_STEPS = 100
+STEP_REWARD = -0.1
+DELIVERY_REWARD = 5.0
+ACTIONS = [(0, 1), (0, -1), (-1, 0), (1, 0)]  # up, down, left, right
+DEPOT = (0, 0)
 
 
 class GridCityEnv:
-    def __init__(self, seed=0, grid=GRID, n_agents=N_AGENTS,
-                 n_tasks=N_TASKS, max_steps=MAX_STEPS):
-        self.rng       = random.Random(seed)
-        self.grid      = grid
-        self.n_agents  = n_agents
-        self.n_tasks   = n_tasks
+    def __init__(
+        self,
+        seed=0,
+        grid=GRID,
+        n_agents=N_AGENTS,
+        n_tasks=N_TASKS,
+        max_steps=MAX_STEPS,
+    ):
+        if grid < 2:
+            raise ValueError("grid must be at least 2")
+        if n_agents < 1 or n_tasks < 1:
+            raise ValueError("n_agents and n_tasks must be positive")
+
+        self.rng = random.Random(seed)
+        self.grid = grid
+        self.n_agents = n_agents
+        self.n_tasks = n_tasks
         self.max_steps = max_steps
         self.n_actions = len(ACTIONS)
-        self.obs_dim   = 2 + 3 * n_agents + 5 * n_tasks + 1
-        self._reset_state()
 
-    def _reset_state(self):
-        self.t              = 0
-        self.positions      = [DEPOT] * self.n_agents
-        self.carrying       = [None] * self.n_agents
-        self.task_delivered = [False] * self.n_tasks
-        self.done           = False
-        self.tasks          = [self._new_task() for _ in range(self.n_tasks)]
+        # Observation = agent ID + all drone states + all task states + time.
+        self.obs_dim = n_agents + 3 * n_agents + 5 * n_tasks + 1
+        self._reset_state()
 
     def _new_task(self):
         while True:
-            p = (self.rng.randrange(self.grid), self.rng.randrange(self.grid))
-            d = (self.rng.randrange(self.grid), self.rng.randrange(self.grid))
-            if p != d:
-                return {"pickup": p, "dropoff": d}
+            pickup = (
+                self.rng.randrange(self.grid),
+                self.rng.randrange(self.grid),
+            )
+            dropoff = (
+                self.rng.randrange(self.grid),
+                self.rng.randrange(self.grid),
+            )
+            if pickup != dropoff:
+                return {"pickup": pickup, "dropoff": dropoff}
+
+    def _reset_state(self):
+        self.t = 0
+        self.positions = [DEPOT] * self.n_agents
+        self.carrying = [None] * self.n_agents
+        self.task_delivered = [False] * self.n_tasks
+        self.done = False
+        self.tasks = [self._new_task() for _ in range(self.n_tasks)]
 
     def reset(self, seed=None):
         if seed is not None:
@@ -53,79 +72,105 @@ class GridCityEnv:
         return self._obs_all()
 
     def step(self, joint_action):
-        prev = self._snapshot()
-        next_state, n_completions = self._transition(prev, joint_action)
+        if self.done:
+            raise RuntimeError("Episode is finished; call reset() before step().")
+        if len(joint_action) != self.n_agents:
+            raise ValueError(f"Expected {self.n_agents} actions")
+        if any(int(a) not in range(self.n_actions) for a in joint_action):
+            raise ValueError("Each action must be an integer in [0, 3]")
 
-        per_alt = [[0.0] * self.n_actions for _ in range(self.n_agents)]
+        joint_action = [int(a) for a in joint_action]
+        previous_state = self._snapshot()
+        next_state, n_completions = self._transition(previous_state, joint_action)
+
+        # For each drone and each possible action, hold the other drones'
+        # sampled actions fixed and calculate the resulting team reward.
+        per_alternative = [
+            [0.0] * self.n_actions for _ in range(self.n_agents)
+        ]
         for i in range(self.n_agents):
-            for a_alt in range(self.n_actions):
-                joint_alt = list(joint_action)
-                joint_alt[i] = a_alt
-                _, n_comp_alt = self._transition(prev, joint_alt)
-                per_alt[i][a_alt] = STEP_REWARD + DELIVERY_REW * n_comp_alt
+            for alternative_action in range(self.n_actions):
+                alternative_joint_action = list(joint_action)
+                alternative_joint_action[i] = alternative_action
+                _, alternative_completions = self._transition(
+                    previous_state, alternative_joint_action
+                )
+                per_alternative[i][alternative_action] = (
+                    STEP_REWARD + DELIVERY_REWARD * alternative_completions
+                )
 
         self._apply(next_state)
-        team_reward = STEP_REWARD + DELIVERY_REW * n_completions
-        return self._obs_all(), team_reward, self.done, {
-            "per_alternative": per_alt,
-            "team_reward":     team_reward,
-            "n_delivered":     sum(self.task_delivered),
+        team_reward = STEP_REWARD + DELIVERY_REWARD * n_completions
+
+        info = {
+            "per_alternative": per_alternative,
+            "team_reward": team_reward,
+            "n_delivered": sum(self.task_delivered),
+            "deliveries_this_step": n_completions,
         }
+        return self._obs_all(), team_reward, self.done, info
 
     def _snapshot(self):
+        # Task definitions are immutable during an episode, so sharing this
+        # list between snapshots is safe.
         return {
-            "positions":      list(self.positions),
-            "carrying":       list(self.carrying),
+            "positions": list(self.positions),
+            "carrying": list(self.carrying),
             "task_delivered": list(self.task_delivered),
-            "tasks":          self.tasks,   # never mutated in place
+            "tasks": self.tasks,
         }
 
     def _transition(self, state, joint_action):
-        positions      = list(state["positions"])
-        carrying       = list(state["carrying"])
+        positions = list(state["positions"])
+        carrying = list(state["carrying"])
         task_delivered = list(state["task_delivered"])
-        n_completions  = 0
+        n_completions = 0
 
-        # 1) move (clamped at grid edges — "stay" via bumping a wall)
-        for i, a in enumerate(joint_action):
-            dx, dy = ACTIONS[a]
-            positions[i] = (max(0, min(self.grid - 1, positions[i][0] + dx)),
-                            max(0, min(self.grid - 1, positions[i][1] + dy)))
+        # 1. Move all drones. Grid boundaries act as walls.
+        for i, action in enumerate(joint_action):
+            dx, dy = ACTIONS[action]
+            x, y = positions[i]
+            positions[i] = (
+                max(0, min(self.grid - 1, x + dx)),
+                max(0, min(self.grid - 1, y + dy)),
+            )
 
-        # 2) deliver
+        # 2. Deliver carried tasks.
         for i in range(self.n_agents):
-            if carrying[i] is None:
+            task_id = carrying[i]
+            if task_id is None:
                 continue
-            if positions[i] == state["tasks"][carrying[i]]["dropoff"]:
-                task_delivered[carrying[i]] = True
+            if positions[i] == state["tasks"][task_id]["dropoff"]:
+                task_delivered[task_id] = True
                 carrying[i] = None
                 n_completions += 1
 
-        # 3) claim (agent-order tie-break: agent 0 wins contested pickups)
-        claimed = set()
+        # 3. Pick up available tasks. If multiple drones reach the same
+        # pickup in one step, the lower-index drone gets priority.
+        claimed_this_step = set()
         for i in range(self.n_agents):
             if carrying[i] is not None:
                 continue
-            for idx, task in enumerate(state["tasks"]):
-                if task_delivered[idx] or idx in claimed:
+            for task_id, task in enumerate(state["tasks"]):
+                if task_delivered[task_id] or task_id in claimed_this_step:
                     continue
                 if positions[i] == task["pickup"]:
-                    carrying[i] = idx
-                    claimed.add(idx)
+                    carrying[i] = task_id
+                    claimed_this_step.add(task_id)
                     break
 
         return {
-            "positions":      positions,
-            "carrying":       carrying,
+            "positions": positions,
+            "carrying": carrying,
             "task_delivered": task_delivered,
-            "tasks":          state["tasks"],
+            "tasks": state["tasks"],
         }, n_completions
 
     def _apply(self, next_state):
-        self.positions      = next_state["positions"]
-        self.carrying       = next_state["carrying"]
+        self.positions = next_state["positions"]
+        self.carrying = next_state["carrying"]
         self.task_delivered = next_state["task_delivered"]
-        self.t             += 1
+        self.t += 1
         if all(self.task_delivered) or self.t >= self.max_steps:
             self.done = True
 
@@ -133,18 +178,36 @@ class GridCityEnv:
         return [self._obs_agent(i) for i in range(self.n_agents)]
 
     def _obs_agent(self, agent_id):
-        g = self.grid - 1
-        id_onehot = [1.0 if agent_id == j else 0.0
-                     for j in range(self.n_agents)]
-        drones = []
+        scale = float(self.grid - 1)
+        agent_id_onehot = [
+            1.0 if agent_id == j else 0.0 for j in range(self.n_agents)
+        ]
+
+        drone_features = []
         for i in range(self.n_agents):
             x, y = self.positions[i]
-            carry_code = 3 if self.carrying[i] is None else self.carrying[i]
-            drones.extend([x / g, y / g, carry_code / 3.0])
-        tasks = []
-        for idx in range(self.n_tasks):
-            t = self.tasks[idx]
-            tasks.extend([t["pickup"][0] / g, t["pickup"][1] / g,
-                          t["dropoff"][0] / g, t["dropoff"][1] / g,
-                          1.0 if self.task_delivered[idx] else 0.0])
-        return id_onehot + drones + tasks + [self.t / self.max_steps]
+            carrying_code = (
+                self.n_tasks if self.carrying[i] is None else self.carrying[i]
+            )
+            drone_features.extend(
+                [x / scale, y / scale, carrying_code / max(1, self.n_tasks)]
+            )
+
+        task_features = []
+        for task_id, task in enumerate(self.tasks):
+            task_features.extend(
+                [
+                    task["pickup"][0] / scale,
+                    task["pickup"][1] / scale,
+                    task["dropoff"][0] / scale,
+                    task["dropoff"][1] / scale,
+                    1.0 if self.task_delivered[task_id] else 0.0,
+                ]
+            )
+
+        return (
+            agent_id_onehot
+            + drone_features
+            + task_features
+            + [self.t / self.max_steps]
+        )
